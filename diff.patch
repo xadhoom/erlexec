@@ -1,0 +1,464 @@
+diff --git a/c_src/exec.cpp b/c_src/exec.cpp
+index 9b557cb..b10a49a 100644
+--- a/c_src/exec.cpp
++++ b/c_src/exec.cpp
+@@ -72,6 +72,7 @@ bool  ei::pipe_valid      = true;
+ int   ei::max_fds;
+ int   ei::dev_null;
+ int   ei::sigchld_pipe[2] = { -1, -1 }; // Pipe for delivering sig child details
++int   run_as_euid         = INT_MAX;
+ 
+ //-------------------------------------------------------------------------
+ // Types & variables
+@@ -87,7 +88,7 @@ pid_t           ei::self_pid;
+ // Local Functions
+ //-------------------------------------------------------------------------
+ bool    process_command();
+-void    initialize(int userid, bool use_alt_fds, bool enable_suid,
++void    initialize(int userid, bool use_alt_fds, bool is_root,
+                    bool requested_root);
+ int     finalize(fd_set& read_fds);
+ 
+@@ -123,9 +124,8 @@ int main(int argc, char* argv[])
+     struct sigaction sact, sterm;
+     int    userid         = 0;
+     bool   use_alt_fds    = false;
+-    bool   enable_suid    = false;
++    bool   is_root        = geteuid() == 0;
+     bool   requested_root = false;
+-    bool   is_suid_set    = false;
+ 
+     self_pid = getpid();
+ 
+@@ -164,23 +164,22 @@ int main(int argc, char* argv[])
+                     fprintf(stderr, "User %s not found!\r\n", run_as_user);
+                     exit(3);
+                 }
+-                userid = pw->pw_uid;
++                run_as_euid = userid = pw->pw_uid;
+                 if (stat(argv[0], &st) < 0) {
+                     fprintf(stderr, "Cannot stat the %s file: %s\r\n", argv[0],
+                                     strerror(errno));
+                     exit(3);
+                 }
+-                is_suid_set = st.st_mode & S_ISUID && st.st_uid == 0;
++                if (st.st_mode & S_ISUID && st.st_uid == 0)
++                    is_root = true;
+                 if (debug > 2)
+                     fprintf(stderr, "SUID bit %sset on %s owned by uid=%d\r\n",
+                                     argv[0], (st.st_mode & S_ISUID) ? "" : " NOT", st.st_uid);
+-            } else if (strcmp(argv[res], "-suid") == 0) {
+-                enable_suid = true;
+             }
+         }
+     }
+ 
+-    initialize(userid, use_alt_fds, enable_suid || is_suid_set, requested_root);
++    initialize(userid, use_alt_fds, is_root, requested_root);
+ 
+     // Set up a pipe to deliver SIGCHLD details to pselect() and setup SIGCHLD handler
+     if (pipe(sigchld_pipe) < 0) {
+@@ -350,7 +349,7 @@ bool process_command()
+         }
+         case RUN: {
+             // {run, Cmd::string(), Options::list()}
+-            CmdOptions po;
++            CmdOptions po(run_as_euid);
+ 
+             if (arity != 3 || po.ei_decode(eis, true) < 0) {
+                 send_error_str(transId, false, po.strerror());
+@@ -483,33 +482,34 @@ bool process_command()
+     return true;
+ }
+ 
+-void initialize(int userid, bool use_alt_fds, bool enable_suid, bool requested_root)
++int ei::set_euid(int userid)
+ {
+-    if ((getuid() == 0 && userid > 0) || (getuid() != 0 && enable_suid)) {
+-        if (
+-            #ifdef HAVE_SETRESUID
+-            setresuid(-1, userid, geteuid()) // glibc, FreeBSD, OpenBSD, HP-UX
+-            #elif HAVE_SETREUID
+-            setreuid(-1, userid)             // MacOSX, NetBSD, AIX, IRIX, Solaris>=2.5, OSF/1, Cygwin
+-            #else
+-            #error setresuid(3) not supported!
+-            #endif
+-        < 0) {
+-            perror("Failed to set effective userid");
+-            exit(4);
+-        }
+-
+-        if (debug)
+-            fprintf(stderr, "Initializing: uid=0, euid=%d, userid=%d%s\r\n",
+-                getuid(), userid, enable_suid?" enable-suid":"");
++    #ifdef HAVE_SETRESUID
++    int res = setresuid(-1, userid, geteuid()); // glibc, FreeBSD, OpenBSD, HP-UX
++    #elif HAVE_SETREUID
++    int res = setreuid(-1,  userid)             // MacOSX, NetBSD, AIX, IRIX, Solaris>=2.5, OSF/1, Cygwin
++    #else
++    #error setresuid(3) not supported!
++    #endif
++    return res < 0 ? res : geteuid();
++}
+ 
+-    } else if (getuid() == 0 && userid == 0 && !requested_root) {
++void initialize(int userid, bool use_alt_fds, bool is_root, bool requested_root)
++{
++    // In root mode, we are running exec-port as another effective
++    // user `userid`, and the spawned child processes to be the
++    // effective user `userid` by default, unless overriden in the
++    // `{user, User}` option by the executed command (in which case
++    // only users from the `{limit_users, Users}` list are permitted
++    // to be effective users.
++
++    if (is_root && userid == 0 && !requested_root) {
+         fprintf(stderr, "Not allowed to run as root without setting effective user (-user option)!\r\n");
+         exit(4);
+-    } else if (getuid() > 0 && userid == 0 && requested_root) {
++    } else if (!is_root && userid == 0 && requested_root) {
+         fprintf(stderr, "Requested to run as root (-user root), but effective user is not root!\r\n");
+         exit(4);
+-    } else if (userid > 0 && int(getuid()) != userid) {
++    } else if (!is_root && userid > 0 && int(geteuid()) != userid) {
+         fprintf(stderr, "Cannot switch effective user to euid=%d\r\n", userid);
+         exit(4);
+     } else if (!getenv("SHELL") || strcmp(getenv("SHELL"), "") == 0) {
+@@ -517,15 +517,22 @@ void initialize(int userid, bool use_alt_fds, bool enable_suid, bool requested_r
+         exit(4);
+     }
+ 
++    // (is_root && requested_root && userid > 0)
++    // Make sure that we can switch effective user without issues
++    if (userid > 0 && ei::set_euid(userid) < 0) {
++        fprintf(stderr, "Failed to set effective userid: %s\r\n", strerror(errno));
++        exit(4);
++    }
++
+     if (debug)
+         fprintf(stderr, "Initializing: uid=%d, userid=%d%s%s\r\n",
+-            getuid(), userid, enable_suid ? " enable-suid":"",
++            getuid(), userid, is_root ? " is-root":"",
+             requested_root ? " requested-root":"");
+ 
+-    // If we are root, switch to non-root user and set capabilities
++    // If we were root, set capabilities
+     // to be able to adjust niceness and run commands as other users.
+     // unless run_as_root is set
+-    if (userid > 0 && enable_suid) {
++    if (userid > 0 && is_root) {
+         #ifdef HAVE_CAP
+         if (prctl(PR_SET_KEEPCAPS, 1) < 0) {
+             perror("Failed to call prctl to keep capabilities");
+@@ -537,12 +544,6 @@ void initialize(int userid, bool use_alt_fds, bool enable_suid, bool requested_r
+         if (debug && (pw = getpwuid(geteuid())) != NULL)
+             fprintf(stderr, "exec: running as: %s (euid=%d)\r\n", pw->pw_name, geteuid());
+ 
+-        if (geteuid() == 0) {
+-            fprintf(stderr, "exec: failed to set effective userid to a non-root user %s (uid=%d)\r\n",
+-                    pw ? pw->pw_name : "", geteuid());
+-            exit(7);
+-        }
+-
+         #ifdef HAVE_CAP
+         cap_t cur;
+         if ((cur = cap_from_text("cap_setuid=eip cap_kill=eip cap_sys_nice=eip")) == 0) {
+@@ -569,7 +570,6 @@ void initialize(int userid, bool use_alt_fds, bool enable_suid, bool requested_r
+             fprintf(stderr, "exec: SHELL variable is not set!\r\n");
+             exit(10);
+         }
+-
+     }
+ 
+     #if !defined(NO_SYSCONF)
+diff --git a/c_src/exec.hpp b/c_src/exec.hpp
+index b41dff3..7181d20 100644
+--- a/c_src/exec.hpp
++++ b/c_src/exec.hpp
+@@ -155,6 +155,7 @@ const char* stream_name(int i);
+ 
+ int     read_sigchld(pid_t& child);
+ void    check_child_exit(pid_t pid);
++int     set_euid(int userid);
+ int     set_nice(pid_t pid,int nice, std::string& error);
+ bool    process_sigchld();
+ bool    set_pid_winsz(CmdInfo& ci, int rows, int cols);
+@@ -257,12 +258,12 @@ private:
+     }
+ 
+ public:
+-    CmdOptions()
++    CmdOptions(int def_user=INT_MAX)
+         : m_tmp(0, 256), m_shell(true), m_pty(false)
+         , m_kill_timeout(KILL_TIMEOUT_SEC)
+         , m_kill_group(false)
+         , m_cenv(NULL), m_nice(INT_MAX)
+-        , m_group(INT_MAX), m_user(INT_MAX)
++        , m_group(INT_MAX), m_user(def_user)
+         , m_success_exit_code(0)
+     {
+         init_streams();
+diff --git a/c_src/exec_impl.cpp b/c_src/exec_impl.cpp
+index f0a4968..c768daf 100644
+--- a/c_src/exec_impl.cpp
++++ b/c_src/exec_impl.cpp
+@@ -312,10 +312,10 @@ pid_t start_child(CmdOptions& op, std::string& error)
+     }
+ 
+     if (debug) {
+-        fprintf(stderr, "Starting child: '%s'\r\n"
++        fprintf(stderr, "Starting child: '%s' (euid=%d)\r\n"
+                         "  child  = (stdin=%s, stdout=%s, stderr=%s)\r\n"
+                         "  parent = (stdin=%s, stdout=%s, stderr=%s)\r\n",
+-            op.cmd().front().c_str(),
++            op.cmd().front().c_str(), op.user(),
+             fd_type(stream_fd[STDIN_FILENO ][RD]).c_str(),
+             fd_type(stream_fd[STDOUT_FILENO][WR]).c_str(),
+             fd_type(stream_fd[STDERR_FILENO][WR]).c_str(),
+diff --git a/src/exec.erl b/src/exec.erl
+index 3b065ad..5911072 100644
+--- a/src/exec.erl
++++ b/src/exec.erl
+@@ -11,17 +11,25 @@
+ %%%      The port program serves as a middle-man between
+ %%%      the OS and the virtual machine to carry out OS-specific low-level
+ %%%      process control.  The Erlang/C++ protocol is described in the
+-%%%      `exec.cpp' file.  On platforms/environments which permit
+-%%%      setting the suid bit on the `exec-port' executable, it can
+-%%%      run external tasks by impersonating a different user. When
+-%%%      suid bit is on and the port program is owned by root
+-%%%      (`chown root:root exec-port; chmod 4755 exec-port'),
+-%%%      the application requires `exec:start_link/2'
+-%%%      to be given the `{user, User}' option so that `exec-port'
+-%%%      will not run as root but will switch to the given effective user.
+-%%%      Before changing the effective `User', it sets the kernel
++%%%      `exec.cpp' file.  The `exec' application can execute tasks by
++%%%      impersonating as a different effective user.  This impersonation
++%%%      can be accomplished in one of the following two ways (assuming
++%%%      that the emulator is not running as `root':
++%%%
++%%%      * Having the user account running the erlang emulator added to
++%%%        the `/etc/sudoers' file, so that it can execute `exec-port'
++%%%        task as `root'. (Preferred option)
++%%%      * Setting `root' ownership on `exec-port', and setting the
++%%%        SUID bit: `chown root:root exec-port; chmod 4755 exec-port'.
++%%%        (This option is discouraged as it's less secure).
++%%%
++%%%      In either of these two cases, `exec:start_link/2' must be started
++%%%      with options `[root, {user, User}, {limit_users, Users}]',
++%%%      so that `exec-port' process will not actually run as
++%%%      root but will switch to the effective `User', and set the kernel
+ %%%      capabilities so that it's able to start processes as other
+-%%%      users and adjust process priorities.
++%%%      effective users given in the `Users' list and adjust process
++%%%      priorities.
+ %%%
+ %%%      At exit the port program makes its best effort to perform
+ %%%      clean shutdown of all child OS processes.
+@@ -320,7 +328,12 @@ start() ->
+ 
+ -spec start(exec_options()) -> {ok, pid()} | {error, any()}.
+ start(Options) when is_list(Options) ->
+-    gen_server:start({local, ?MODULE}, ?MODULE, [Options], []).
++    case check_options(Options) of
++        ok ->
++            gen_server:start({local, ?MODULE}, ?MODULE, [Options], []);
++        {error, Reason} ->
++            {error, Reason}
++    end.
+ 
+ %%-------------------------------------------------------------------------
+ %% @doc Run an external program. `OsPid' is the OS process identifier of
+@@ -631,7 +644,10 @@ init([Options]) ->
+             UserExe   -> UserExe
+             end,
+     Args  = lists:flatten(Args0),
+-    Users = proplists:get_value(limit_users, Options, default(limit_users)),
++    Users = case proplists:get_value(limit_users, Options, default(limit_users)) of
++            [] -> [];
++            L  -> [to_list(I) || I <- L]
++            end,
+     User  = proplists:get_value(user,        Options),
+     Debug = proplists:get_value(verbose,     Options, default(verbose)),
+     Root  = proplists:get_value(root,        Options, default(root)),
+@@ -641,50 +657,44 @@ init([Options]) ->
+             end,
+     % When instructing to run as root, check that the port program has
+     % the SUID bit set or else use "sudo"
+-    SUID  = case file:read_file_info(Exe0) of
+-            {ok, Info} ->
+-                (Info#file_info.mode band 8#4500) =:= 8#4500 andalso
+-                (Info#file_info.uid == 0);
+-            {error, Err} ->
+-                throw("Cannot find file " ++ Exe0 ++ ": " ++ file:format_error(Err))
+-            end,
++    {SUID,NeedSudo} = is_suid_and_root_owner(Exe0),
+     EffUsr= os:getenv("USER"),
+     IsRoot= EffUsr =:= "root",
+-    {Exe,Msg} =
+-            if SUID andalso Root; IsRoot ->
+-                if User==undefined orelse User=="" ->
+-                    % Don't allow to run port program with SUID bit without effective user set!
+-                    throw("Port program " ++ Exe0 ++
+-                          " is not allowed to run without specifying effective user ({user, User})!");
+-                true ->
+-                    {Exe0++Args, undefined}
+-                end;
+-            not Root, User =/= undefined ->
+-                % Running as another effective user
+-                U = if is_atom(User) -> atom_to_list(User); true -> User end,
+-                {lists:append(["/usr/bin/sudo -u ", U, " ", Exe0, Args]), undefined};
+-            SUID, EffUsr/="root", EffUsr/=User, User/=undefined, User/=root, User/="root" ->
+-                % Running as root that will switch to another effective user with SUID support
+-                {lists:append(["/usr/bin/sudo ", Exe0, " -suid", Args]), undefined};
++    Exe   = if not Root ->
++                Exe0++Args;
++            Root, IsRoot, User/=undefined, User/="", ((SUID     andalso Users/=[]) orelse
++                                                      (not SUID andalso Users==[])) ->
++                Exe0++Args;
++            %Root, not IsRoot, NeedSudo, User/=undefined, User/="" ->
++                % Asked to enable root, but running as non-root, and have no SUID: use sudo.
++            %    lists:append(["/usr/bin/sudo -u ", to_list(User), " ", Exe0, Args]);
++            Root, not IsRoot, NeedSudo, ((User/=undefined andalso User/="") orelse
++                                         (EffUsr/=User andalso User/=undefined
++                                                       andalso User/=root
++                                                       andalso User/="root")) ->
++                % Asked to enable root, but running as non-root, and have SUID: use sudo.
++                lists:append(["/usr/bin/sudo ", Exe0, Args]);
+             true ->
+-                {Exe0 ++ Args, undefined}
++                Exe0++Args
+             end,
++    debug(Debug, "exec: ~s~sport program: ~s\n~s",
++        [if SUID -> "[SUID] "; true -> "" end,
++         if (Root orelse IsRoot) andalso User =:= undefined -> "[ROOT] "; true -> "" end,
++         Exe,
++         if Env =/= [] -> "  env: "++?FMT("~p", Env)++"\n"; true -> "" end]),
+     try
+-        debug(Debug, "exec: ~s~sport program: ~s\n~s",
+-            [if SUID -> "[SUID] "; true -> "" end,
+-             if (Root orelse IsRoot) andalso User =:= undefined -> "[ROOT] "; true -> "" end, Exe,
+-             if Env =/= [] -> "  env: "++?FMT("~p", Env)++"\n"; true -> "" end]),
+         PortOpts = Env ++ [binary, exit_status, {packet, 2}, hide],
+         Port = erlang:open_port({spawn, Exe}, PortOpts),
+-        case Msg of
+-        undefined -> ok;
+-        _         -> error_logger:warning_msg(Msg, [])
+-        end,
+-        Tab  = ets:new(exec_mon, [protected,named_table]),
+-        {ok, #state{port=Port, limit_users=Users, debug=Debug, registry=Tab, root=Root}}
++        receive
++            {Port, {exit_status, Status}} ->
++                {stop, {port_existed_with_status, Status}}
++        after 350 ->
++            Tab = ets:new(exec_mon, [protected,named_table]),
++            {ok, #state{port=Port, limit_users=Users, debug=Debug, registry=Tab, root=Root}}
++        end
+     catch
+         ?EXCEPTION(_, Reason, Stacktrace) ->
+-            {stop, ?FMT("Error starting port '~s': ~200p\n  ~s\n",
++            {stop, ?FMT("Error starting port '~s': ~200p\n  ~p\n",
+                 [Exe, Reason, ?GET_STACK(Stacktrace)])}
+     end.
+ 
+@@ -807,6 +817,11 @@ terminate(_Reason, State) ->
+         ok
+     end.
+ 
++to_list(undefined)           -> [];
++to_list(A) when is_atom(A)   -> atom_to_list(A);
++to_list(L) when is_list(L)   -> L;
++to_list(B) when is_binary(B) -> binary_to_list(B).
++
+ wait_port_exit(Port) ->
+     receive
+     {Port,{exit_status,Status}} ->
+@@ -962,9 +977,51 @@ send_to_ospid_owner(OsPid, Msg) ->
+ 
+ debug(false, _, _) ->
+     ok;
+-debug(true, Fmt, Args) ->
++debug(_, Fmt, Args) ->
+     io:format(Fmt, Args).
+ 
++is_suid_and_root_owner(File) ->
++    case file:read_file_info(File) of
++    {ok, Info} ->
++        {(Info#file_info.mode band 8#4500) =:= 8#4500,
++         (Info#file_info.uid =/= 0)};
++    {error, Err} ->
++        throw("Cannot find file " ++ File ++ ": " ++ file:format_error(Err))
++    end.
++
++check_options(Options) when is_list(Options) ->
++    Users = proplists:get_value(limit_users, Options, default(limit_users)),
++    User  = proplists:get_value(user,        Options),
++    Root  = proplists:get_value(root,        Options, default(root)),
++    % When instructing to run as root, check that the port program has
++    % the SUID bit set or else use "sudo"
++    Exe   = case proplists:get_value(portexe, Options, undefined) of
++                undefined -> default(portexe);
++                Other     -> Other
++            end,
++    {SUID,NeedSudo} = is_suid_and_root_owner(Exe),
++    if Root, (User==undefined orelse User=="") ->
++        % Asked to enable root, but User is not set
++        {error, "Not allowed to run without proviting effective user {user,User}!"};
++    Root, Users==[] ->
++        % Asked to enable root, have SUID
++        {error, "Not allowed to run without restricting effective users {limit_users,Users}!"};
++    Root, User/=undefined, User/="", Users/=[] ->
++        ok;
++    not Root, SUID, not NeedSudo, Users==[] ->
++        {error, "Not allowed to run as SUID root without restricting effective users {limit_users,Users}!"};
++    not Root, User/=undefined ->
++        {error, "Cannot specify effective user {user,User} in non-root mode!"};
++        ok;
++    not Root, Users/=[] ->
++        {error, "Cannot restrict users {limit_users,Users} in non-root mode!"};
++        ok;
++    not Root ->
++        ok;
++    true ->
++        {error, "Invalid root and user arguments"}
++    end.
++
+ %%----------------------------------------------------------------------
+ %% @spec (Pid::pid(), Action, State::#state{}) ->
+ %%          {ok, LastTok::integer(), LeftLinks::integer()}
+@@ -1104,9 +1161,9 @@ check_cmd_options([{Std, I}=H|T], Pid, State, PortOpts, OtherOpts)
+     end;
+ check_cmd_options([{group, I}=H|T], Pid, State, PortOpts, OtherOpts) when is_integer(I), I >= 0; is_list(I) ->
+     check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
+-check_cmd_options([{user, U}=H|T], Pid, State, PortOpts, OtherOpts) when is_list(U), U =/= "" ->
++check_cmd_options([{user, U}|T], Pid, State, PortOpts, OtherOpts) when is_list(U), U =/= ""; is_atom(U) ->
+     case lists:member(U, State#state.limit_users) of
+-    true  -> check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
++    true  -> check_cmd_options(T, Pid, State, [{user,to_list(U)}|PortOpts], OtherOpts);
+     false -> throw({error, ?FMT("User ~s is not allowed to run commands!", [U])})
+     end;
+ check_cmd_options([Other|_], _Pid, _State, _PortOpts, _OtherOpts) ->
+@@ -1152,6 +1209,7 @@ exec_test_() ->
+         fun()    -> {ok, Pid} = exec:start([{debug, 0}]), Pid end,
+         fun(Pid) -> exit(Pid, kill) end,
+         [
++            ?tt(test_root()),
+             ?tt(test_monitor()),
+             ?tt(test_sync()),
+             ?tt(test_winsz()),
+@@ -1173,6 +1231,16 @@ exec_test_() ->
+ exec_run_many_test() ->
+     ?assertMatch({ok,[{io_ops,300},{success,300}]}, test_exec:run(300)).
+ 
++test_root() ->
++    ?assertMatch({error, "Cannot specify effective user"++_},
++                 exec:start([{user, "xxxx"}, {limit_users, [yyyy]}])),
++    ?assertMatch({error, "Cannot restrict users"++_},
++                 exec:start([{limit_users, [yyyy]}])),
++    ?assertMatch({error, "Not allowed to run without restricting effective users"++_},
++                 exec:start([root, {user, "xxxx"}])),
++    ?assertMatch({error, "Not allowed to run without proviting effective user "++_},
++                 exec:start([root, {limit_users, [yyyy]}])).
++
+ test_monitor() ->
+     {ok, P, _} = exec:run("echo ok", [{stdout, null}, monitor]),
+     ?receiveMatch({'DOWN', _, process, P, normal}, 5000).

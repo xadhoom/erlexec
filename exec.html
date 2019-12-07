@@ -1,0 +1,255 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<title>Module exec</title>
+<link rel="stylesheet" type="text/css" href="stylesheet.css" title="EDoc">
+</head>
+<body bgcolor="white">
+<div class="navbar"><a name="#navbar_top"></a><table width="100%" border="0" cellspacing="0" cellpadding="2" summary="navigation bar"><tr><td><a href="overview-summary.html" target="overviewFrame">Overview</a></td><td><a href="http://www.erlang.org/"><img src="erlang.png" align="right" border="0" alt="erlang logo"></a></td></tr></table></div>
+<hr>
+
+<h1>Module exec</h1>
+<ul class="index"><li><a href="#description">Description</a></li><li><a href="#types">Data Types</a></li><li><a href="#index">Function Index</a></li><li><a href="#functions">Function Details</a></li></ul>OS shell command runner.
+
+<p><b>Version:</b> 1.9-53-gc6d7</p>
+<p><b>Behaviours:</b> <a href="gen_server.html"><tt>gen_server</tt></a>.</p>
+<p><b>Authors:</b> Serge Aleynikov (<a href="mailto:saleyn@gmail.com"><tt>saleyn@gmail.com</tt></a>).</p>
+
+<h2><a name="description">Description</a></h2><p>OS shell command runner.
+        It communicates with a separate C++ port process <code>exec-port</code>        
+spawned by this module, which is responsible        
+for starting, killing, listing, terminating, and notifying of        
+state changes.</p>
+  
+        The port program serves as a middle-man between
+        the OS and the virtual machine to carry out OS-specific low-level
+        process control.  The Erlang/C++ protocol is described in the
+        <code>exec.cpp</code> file.  The <code>exec</code> application can execute tasks by
+        impersonating as a different effective user.  This impersonation
+        can be accomplished in one of the following two ways (assuming
+        that the emulator is not running as <code>root</code>:
+        <ul>
+        <li>Having the user account running the erlang emulator added to
+            the <code>/etc/sudoers</code> file, so that it can execute <code>exec-port</code>
+            task as <code>root</code>. (Preferred option)</li>
+        <li>Setting <code>root</code> ownership on <code>exec-port</code>, and setting the
+            SUID bit: <code>chown root:root exec-port; chmod 4755 exec-port</code>.
+            (This option is discouraged as it's less secure).</li>
+        </ul><p>
+        In either of these two cases, <code>exec:start_link/2</code> must be started
+        with options <code>[root, {user, User}, {limit_users, Users}]</code>,
+        so that <code>exec-port</code> process will not actually run as
+        root but will switch to the effective <code>User</code>, and set the kernel
+        capabilities so that it's able to start processes as other
+        effective users given in the <code>Users</code> list and adjust process        
+priorities.</p>
+  
+        <p>Though, in the initial design, <code>exec</code> prohibited such use, upon
+        user requests a feature was added (in order to support <code>docker</code>
+        deployment and CI testing) to be able to execute <code>exec-port</code> as
+        <code>root</code> without switching the effective user to anying other than
+        <code>root</code>. To accomplish this use the following options to start
+        <code>exec</code>: <code>[root, {user, "root"}, {limit_users, ["root"]}]</code>.</p>
+  
+        At exit the port program makes its best effort to perform
+        clean shutdown of all child OS processes.
+        Every started OS process is linked to a spawned light-weight
+        Erlang process returned by the run/2, run_link/2 command.
+        The application ensures that termination of spawned OsPid
+        leads to termination of the associated Erlang Pid, and vice
+        versa.
+  
+<h2><a name="types">Data Types</a></h2>
+
+<h3 class="typedecl"><a name="type-cmd">cmd()</a></h3>
+<p><tt>cmd() = string() | [string()]</tt></p>
+
+
+<h3 class="typedecl"><a name="type-cmd_option">cmd_option()</a></h3>
+<p><tt>cmd_option() = monitor | sync | link | {executable, string()} | {cd, WorkDir::string()} | {env, [string() | {Name::string(), Value::string()}, ...]} | {kill, KillCmd::string()} | {kill_timeout, Sec::non_neg_integer()} | kill_group | {group, GID::string() | integer()} | {user, RunAsUser::string()} | {nice, Priority::integer()} | {success_exit_code, ExitCode::integer()} | stdin | {stdin, null | close | string()} | stdout | stderr | {stdout, stderr | <a href="#type-output_dev_opt">output_dev_opt()</a>} | {stderr, stdout | <a href="#type-output_dev_opt">output_dev_opt()</a>} | {stdout | stderr, string(), [<a href="#type-output_file_opt">output_file_opt()</a>]} | pty</tt></p>
+
+
+<h3 class="typedecl"><a name="type-cmd_options">cmd_options()</a></h3>
+<p><tt>cmd_options() = [<a href="#type-cmd_option">cmd_option()</a>]</tt></p>
+
+
+<h3 class="typedecl"><a name="type-exec_option">exec_option()</a></h3>
+<p><tt>exec_option() = debug | {debug, integer()} | root | {root, boolean()} | verbose | {args, [string(), ...]} | {alarm, non_neg_integer()} | {user, string()} | {limit_users, [string(), ...]} | {portexe, string()} | {env, [{string(), string()}, ...]}</tt></p>
+
+
+<h3 class="typedecl"><a name="type-exec_options">exec_options()</a></h3>
+<p><tt>exec_options() = [<a href="#type-exec_option">exec_option()</a>]</tt></p>
+
+
+<h3 class="typedecl"><a name="type-osgid">osgid()</a></h3>
+<p><tt>osgid() = integer()</tt></p>
+<p>  Representation of OS group ID.</p>
+
+<h3 class="typedecl"><a name="type-ospid">ospid()</a></h3>
+<p><tt>ospid() = integer()</tt></p>
+<p>  Representation of OS process ID.</p>
+
+<h3 class="typedecl"><a name="type-output_dev_opt">output_dev_opt()</a></h3>
+<p><tt>output_dev_opt() = null | close | print | string() | pid() | fun((stdout | stderr, integer(), binary()) -&gt; none())</tt></p>
+
+
+<h3 class="typedecl"><a name="type-output_file_opt">output_file_opt()</a></h3>
+<p><tt>output_file_opt() = append | {mode, Mode::integer()}</tt></p>
+
+
+<h2><a name="index">Function Index</a></h2>
+<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#debug-1">debug/1</a></td><td>Set debug level of the port process.</td></tr>
+<tr><td valign="top"><a href="#kill-2">kill/2</a></td><td>Send a <code>Signal</code> to a child <code>Pid</code>, <code>OsPid</code> or an Erlang <code>Port</code>.</td></tr>
+<tr><td valign="top"><a href="#manage-2">manage/2</a></td><td>Manage an existing external process.</td></tr>
+<tr><td valign="top"><a href="#ospid-1">ospid/1</a></td><td>Get <code>OsPid</code> of the given Erlang <code>Pid</code>.</td></tr>
+<tr><td valign="top"><a href="#pid-1">pid/1</a></td><td>Get <code>Pid</code> of the given <code>OsPid</code>.</td></tr>
+<tr><td valign="top"><a href="#run-2">run/2</a></td><td>Run an external program.</td></tr>
+<tr><td valign="top"><a href="#run_link-2">run_link/2</a></td><td>Run an external program and link to the OsPid.</td></tr>
+<tr><td valign="top"><a href="#send-2">send/2</a></td><td>Send <code>Data</code> to stdin of the OS process identified by <code>OsPid</code>.</td></tr>
+<tr><td valign="top"><a href="#setpgid-2">setpgid/2</a></td><td>Change group ID of a given <code>OsPid</code> to <code>Gid</code>.</td></tr>
+<tr><td valign="top"><a href="#signal-1">signal/1</a></td><td>Convert a signal number to atom.</td></tr>
+<tr><td valign="top"><a href="#start-0">start/0</a></td><td>Start of an external program manager without supervision.</td></tr>
+<tr><td valign="top"><a href="#start-1">start/1</a></td><td></td></tr>
+<tr><td valign="top"><a href="#start_link-1">start_link/1</a></td><td>Supervised start an external program manager.</td></tr>
+<tr><td valign="top"><a href="#status-1">status/1</a></td><td>Decode the program's exit_status.</td></tr>
+<tr><td valign="top"><a href="#stop-1">stop/1</a></td><td>Terminate a managed <code>Pid</code>, <code>OsPid</code>, or <code>Port</code> process.</td></tr>
+<tr><td valign="top"><a href="#stop_and_wait-2">stop_and_wait/2</a></td><td>Terminate a managed <code>Pid</code>, <code>OsPid</code>, or <code>Port</code> process, like
+       <code>stop/1</code>, and wait for it to exit.</td></tr>
+<tr><td valign="top"><a href="#which_children-0">which_children/0</a></td><td>Get a list of children managed by port program.</td></tr>
+<tr><td valign="top"><a href="#winsz-3">winsz/3</a></td><td>Set the pty terminal <code>Rows</code> and <code>Cols</code> of the OS process identified by <code>OsPid</code>.</td></tr>
+</table>
+
+<h2><a name="functions">Function Details</a></h2>
+
+<h3 class="function"><a name="debug-1">debug/1</a></h3>
+<div class="spec">
+<p><tt>debug(Level::integer()) -&gt; {ok, OldLevel::integer()} | {error, timeout}</tt><br></p>
+</div><p>Set debug level of the port process.</p>
+
+<h3 class="function"><a name="kill-2">kill/2</a></h3>
+<div class="spec">
+<p><tt>kill(Pid::pid() | <a href="#type-ospid">ospid()</a>, Signal::integer()) -&gt; ok | {error, any()}</tt><br></p>
+</div><p>Send a <code>Signal</code> to a child <code>Pid</code>, <code>OsPid</code> or an Erlang <code>Port</code>.</p>
+
+<h3 class="function"><a name="manage-2">manage/2</a></h3>
+<div class="spec">
+<p><tt>manage(Pid::<a href="#type-ospid">ospid()</a> | port(), Options::<a href="#type-cmd_options">cmd_options()</a>) -&gt; {ok, pid(), <a href="#type-ospid">ospid()</a>} | {error, any()}</tt><br></p>
+</div><p>Manage an existing external process. <code>OsPid</code> is the OS process
+       identifier of the external OS process or an Erlang <code>Port</code> that
+       would be managed by erlexec.</p>
+
+<h3 class="function"><a name="ospid-1">ospid/1</a></h3>
+<div class="spec">
+<p><tt>ospid(Pid::pid()) -&gt; <a href="#type-ospid">ospid()</a> | {error, Reason::any()}</tt><br></p>
+</div><p>Get <code>OsPid</code> of the given Erlang <code>Pid</code>.  The <code>Pid</code> must be created
+       previously by running the run/2 or run_link/2 commands.</p>
+
+<h3 class="function"><a name="pid-1">pid/1</a></h3>
+<div class="spec">
+<p><tt>pid(OsPid::<a href="#type-ospid">ospid()</a>) -&gt; pid() | undefined | {error, timeout}</tt><br></p>
+</div><p>Get <code>Pid</code> of the given <code>OsPid</code>.  The <code>OsPid</code> must be created
+       previously by running the run/2 or run_link/2 commands.</p>
+
+<h3 class="function"><a name="run-2">run/2</a></h3>
+<div class="spec">
+<p><tt>run(Exe::<a href="#type-cmd">cmd()</a>, Options::<a href="#type-cmd_options">cmd_options()</a>) -&gt; {ok, pid(), <a href="#type-ospid">ospid()</a>} | {ok, [{stdout | stderr, [binary()]}]} | {error, any()}</tt><br></p>
+</div><p>Run an external program. <code>OsPid</code> is the OS process identifier of
+       the new process. If <code>sync</code> is specified in <code>Options</code> the return
+       value is <code>{ok, Status}</code> where <code>Status</code> is OS process exit status.
+       The <code>Status</code> can be decoded with <code>status/1</code> to determine the
+       process's exit code and if it was killed by signal.</p>
+
+<h3 class="function"><a name="run_link-2">run_link/2</a></h3>
+<div class="spec">
+<p><tt>run_link(Exe::<a href="#type-cmd">cmd()</a>, Options::<a href="#type-cmd_options">cmd_options()</a>) -&gt; {ok, pid(), <a href="#type-ospid">ospid()</a>} | {ok, [{stdout | stderr, [binary()]}]} | {error, any()}</tt><br></p>
+</div><p>Equivalent to <tt>run / 2</tt>.</p>
+<p>Run an external program and link to the OsPid. If OsPid exits,
+       the calling process will be killed or if it's trapping exits,
+       it'll get {'EXIT', OsPid, Status} message.  If the calling process
+       dies the OsPid will be killed.
+       The <code>Status</code> can be decoded with <code>status/1</code> to determine the
+       process's exit code and if it was killed by signal.</p>
+
+<h3 class="function"><a name="send-2">send/2</a></h3>
+<div class="spec">
+<p><tt>send(OsPid::<a href="#type-ospid">ospid()</a> | pid(), Data::binary() | eof) -&gt; ok</tt><br></p>
+</div><p><p>Send <code>Data</code> to stdin of the OS process identified by <code>OsPid</code>.</p>
+ 
+  Sending eof instead of binary Data causes close of stdin of the
+  corresponding process. Data sent to closed stdin is ignored.
+ </p>
+
+<h3 class="function"><a name="setpgid-2">setpgid/2</a></h3>
+<div class="spec">
+<p><tt>setpgid(OsPid::<a href="#type-ospid">ospid()</a>, Gid::<a href="#type-osgid">osgid()</a>) -&gt; ok | {error, any()}</tt><br></p>
+</div><p>Change group ID of a given <code>OsPid</code> to <code>Gid</code>.</p>
+
+<h3 class="function"><a name="signal-1">signal/1</a></h3>
+<div class="spec">
+<p><tt>signal(Num::integer()) -&gt; atom() | integer()</tt><br></p>
+</div><p>Convert a signal number to atom</p>
+
+<h3 class="function"><a name="start-0">start/0</a></h3>
+<div class="spec">
+<p><tt>start() -&gt; {ok, pid()} | {error, any()}</tt><br></p>
+</div><p>Equivalent to <tt>start_link / 1</tt>.</p>
+<p>Start of an external program manager without supervision.
+       Note that the port program requires <code>SHELL</code> environment variable to
+       be set.</p>
+
+<h3 class="function"><a name="start-1">start/1</a></h3>
+<div class="spec">
+<p><tt>start(Options::<a href="#type-exec_options">exec_options()</a>) -&gt; {ok, pid()} | {error, any()}</tt><br></p>
+</div>
+
+<h3 class="function"><a name="start_link-1">start_link/1</a></h3>
+<div class="spec">
+<p><tt>start_link(Options::<a href="#type-exec_options">exec_options()</a>) -&gt; {ok, pid()} | {error, any()}</tt><br></p>
+</div><p>Supervised start an external program manager.
+       Note that the port program requires <code>SHELL</code> environment variable to
+       be set.</p>
+
+<h3 class="function"><a name="status-1">status/1</a></h3>
+<div class="spec">
+<p><tt>status(Status::integer()) -&gt; {status, ExitStatus::integer()} | {signal, Singnal::integer() | atom(), Core::boolean()}</tt><br></p>
+</div><p>Decode the program's exit_status.  If the program exited by signal
+       the function returns <code>{signal, Signal, Core}</code> where the <code>Signal</code>
+       is the signal number or atom, and <code>Core</code> indicates if the core file
+       was generated.</p>
+
+<h3 class="function"><a name="stop-1">stop/1</a></h3>
+<div class="spec">
+<p><tt>stop(Pid::pid() | <a href="#type-ospid">ospid()</a> | port()) -&gt; ok | {error, any()}</tt><br></p>
+</div><p>Terminate a managed <code>Pid</code>, <code>OsPid</code>, or <code>Port</code> process. The OS process is
+       terminated gracefully.  If it was given a <code>{kill, Cmd}</code> option at
+       startup, that command is executed and a timer is started.  If
+       the program doesn't exit, then the default termination is
+       performed.  Default termination implies sending a <code>SIGTERM</code> command
+       followed by <code>SIGKILL</code> in 5 seconds, if the program doesn't get
+       killed.</p>
+
+<h3 class="function"><a name="stop_and_wait-2">stop_and_wait/2</a></h3>
+<div class="spec">
+<p><tt>stop_and_wait(Port::pid() | <a href="#type-ospid">ospid()</a> | port(), Timeout::integer()) -&gt; term() | {error, any()}</tt><br></p>
+</div><p>Terminate a managed <code>Pid</code>, <code>OsPid</code>, or <code>Port</code> process, like
+       <code>stop/1</code>, and wait for it to exit.</p>
+
+<h3 class="function"><a name="which_children-0">which_children/0</a></h3>
+<div class="spec">
+<p><tt>which_children() -&gt; [<a href="#type-ospid">ospid()</a>, ...]</tt><br></p>
+</div><p>Get a list of children managed by port program.</p>
+
+<h3 class="function"><a name="winsz-3">winsz/3</a></h3>
+<div class="spec">
+<p><tt>winsz(OsPid::<a href="#type-ospid">ospid()</a> | pid(), Rows::integer(), Cols::integer()) -&gt; ok</tt><br></p>
+</div><p><p>Set the pty terminal <code>Rows</code> and <code>Cols</code> of the OS process identified by <code>OsPid</code>.</p>
+ 
+  The process must have been created with the <code>pty</code> option.
+ </p>
+<hr>
+
+<div class="navbar"><a name="#navbar_bottom"></a><table width="100%" border="0" cellspacing="0" cellpadding="2" summary="navigation bar"><tr><td><a href="overview-summary.html" target="overviewFrame">Overview</a></td><td><a href="http://www.erlang.org/"><img src="erlang.png" align="right" border="0" alt="erlang logo"></a></td></tr></table></div>
+<p><i>Generated by EDoc</i></p>
+</body>
+</html>
