@@ -1,7 +1,6 @@
 language: erlang
 otp_release:
-  - 18.0
-  - 19.1
+  - 22.3
 compiler: g++
 os:
   - linux
